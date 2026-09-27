@@ -12,11 +12,14 @@ type PyProjectToml struct {
 	Project Project
 }
 
-// Pypi project defined for package managers other than poetry (pip, pipenv, etc...)
+// Pypi project defined for package managers other than poetry (pip, pipenv, etc...). Also
+// used as the Poetry 2.x fallback when [tool.poetry] is absent and the project is declared
+// via the native PEP 621 [project] table instead.
 type Project struct {
-	Name        string
-	Version     string
-	Description string
+	Name         string
+	Version      string
+	Description  string
+	Dependencies []string
 }
 
 // Get project name and version by parsing the pyproject.toml file.

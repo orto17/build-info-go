@@ -3,6 +3,7 @@ package pythonutils
 import (
 	"errors"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -14,6 +15,13 @@ type PoetryPackage struct {
 	Version         string
 	Dependencies    map[string]interface{}
 	DevDependencies map[string]interface{} `toml:"dev-dependencies"`
+	// [tool.poetry.group.<name>.dependencies] tables - the way Poetry 1.2+ declares extra
+	// dependency groups (including "dev"), used alongside either dependency layout.
+	Group map[string]PoetryDependencyGroup `toml:"group"`
+}
+
+type PoetryDependencyGroup struct {
+	Dependencies map[string]interface{}
 }
 
 type PoetryLock struct {
@@ -77,12 +85,87 @@ func extractPoetryPackageFromPyProjectToml(pyProjectFilePath string) (project Po
 	if err != nil {
 		return
 	}
-	if poetryProject, ok := pyProjectFile.Tool["poetry"]; ok {
+	// A TOML table header implicitly creates its parent tables, so pyProjectFile.Tool["poetry"]
+	// can exist with an empty Name even when the only content under [tool.poetry] is a nested
+	// [tool.poetry.group.*] table - which is exactly how a Poetry 2.x project combines the
+	// PEP 621 [project] table with dependency groups. Check Name, not map presence, to decide
+	// which layout declared the project itself.
+	poetryTool := pyProjectFile.Tool["poetry"]
+	groupDependencies := collectPoetryGroupDependencies(poetryTool)
+
+	if poetryTool.Name != "" {
 		// Extract project name from file content.
-		poetryProject.Name = poetryProject.Name + ":" + poetryProject.Version
-		return poetryProject, nil
+		poetryTool.Name = poetryTool.Name + ":" + poetryTool.Version
+		mergeIntoDevDependencies(&poetryTool, groupDependencies)
+		return poetryTool, nil
+	}
+	// No [tool.poetry] name - this may be a Poetry 2.x project declared with the native
+	// PEP 621 [project] table instead of the legacy [tool.poetry] one.
+	if pyProjectFile.Project.Name != "" {
+		project = poetryPackageFromPep621Project(pyProjectFile.Project)
+		mergeIntoDevDependencies(&project, groupDependencies)
+		return project, nil
 	}
 	return PoetryPackage{}, errors.New("Couldn't find project name and version in " + pyProjectFilePath)
+}
+
+// collectPoetryGroupDependencies flattens every [tool.poetry.group.<name>.dependencies] table
+// into a single map, regardless of which layout ([tool.poetry] or PEP 621 [project]) declares
+// the project's main dependencies.
+func collectPoetryGroupDependencies(poetryTool PoetryPackage) map[string]interface{} {
+	if len(poetryTool.Group) == 0 {
+		return nil
+	}
+	merged := make(map[string]interface{})
+	for _, group := range poetryTool.Group {
+		for name, spec := range group.Dependencies {
+			merged[name] = spec
+		}
+	}
+	return merged
+}
+
+// mergeIntoDevDependencies adds groupDependencies into project.DevDependencies, creating the
+// map if needed. Direct and dev dependencies are already merged together by
+// getPoetryPackageFromPyProject, so treating group dependencies as dev dependencies is enough
+// to surface them.
+func mergeIntoDevDependencies(project *PoetryPackage, groupDependencies map[string]interface{}) {
+	if len(groupDependencies) == 0 {
+		return
+	}
+	if project.DevDependencies == nil {
+		project.DevDependencies = make(map[string]interface{}, len(groupDependencies))
+	}
+	for name, spec := range groupDependencies {
+		project.DevDependencies[name] = spec
+	}
+}
+
+func poetryPackageFromPep621Project(project Project) PoetryPackage {
+	dependencies := make(map[string]interface{}, len(project.Dependencies))
+	for _, requirement := range project.Dependencies {
+		if name := pep508PackageName(requirement); name != "" {
+			dependencies[name] = requirement
+		}
+	}
+	return PoetryPackage{
+		Name:         project.Name + ":" + project.Version,
+		Dependencies: dependencies,
+	}
+}
+
+var pep508NameRegex = regexp.MustCompile(`^\s*([A-Za-z0-9][A-Za-z0-9._-]*)`)
+
+// pep508PackageName extracts the bare package name from a PEP 508 requirement string (e.g.
+// "requests[socks]>=2.0 ; python_version >= '3.8'" -> "requests"), as used by a PEP 621
+// [project.dependencies] entry - unlike [tool.poetry.dependencies], which is a TOML table
+// keyed by name directly.
+func pep508PackageName(requirement string) string {
+	match := pep508NameRegex.FindStringSubmatch(requirement)
+	if match == nil {
+		return ""
+	}
+	return match[1]
 }
 
 // Get the project-name by parsing the poetry.lock file
